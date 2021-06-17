@@ -1,1 +1,4 @@
 # NinjaMic
+
+
+![](ninjamic.jpg)
