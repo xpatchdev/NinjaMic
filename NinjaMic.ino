@@ -1,4 +1,4 @@
-//#define A2DP
+#define A2DP
 #define SDCARD
 
 #define WIFI
@@ -16,7 +16,7 @@
 //#include "sdmmc_cmd.h"
 //#include "analogWrite.h"
 
-
+#include "wifidef.h"
 #include "wav_head.h"
 #include <Wire.h>
 
@@ -53,10 +53,11 @@ static const char *TAG = "example";
 #define MOUNT_POINT "/sdcard"
 
 
-#define BUTTON1 0
 #define BUTTON2 35 
+#define BUTTON1 0
 
 
+int16_t map24to16(int32_t x);
 char * btoa8(int8_t n);
 char * btoa8m(int8_t n);
 char * btoa8m2(int8_t n);
@@ -72,6 +73,14 @@ void wavHeader(byte* header, int wavSize);
 void dumpWaveHeader(byte *h);
 void tft_draw(void);
 void i2s_init_mic();
+void startRecord(void);
+void stopRecord(void);
+void displayOff(void);
+void displayOn(void);
+void initA2DP(void);
+void deinitA2DP(void);
+void initWiFi(void);
+void deinitWiFi(void);
 
 
 
@@ -112,10 +121,17 @@ void i2s_init_mic();
 #endif
 
 #define HEADER_SIZE 44
-#define WAV_SAMPLE_RATE 16000
+//#define WAV_SAMPLE_RATE 16000
+//#define WAV_SAMPLE_RATE 32000
+#define WAV_SAMPLE_RATE 44100
+//#define WAV_SAMPLE_RATE 22050
 #define WAV_NUM_CHAN 1
-#define WAV_BIT_PER_SAMPLE 16
-#define WAV_BYTE_PER_SAMPLE 2 //  
+//#define WAV_BIT_PER_SAMPLE 16
+//#define WAV_BIT_PER_SAMPLE 24
+#define WAV_BIT_PER_SAMPLE 32
+//#define WAV_BYTE_PER_SAMPLE 2 //  
+//#define WAV_BYTE_PER_SAMPLE 3
+#define WAV_BYTE_PER_SAMPLE 4
 
 // use first channel of 16 channels (started from zero)
 #define LEDC_CHANNEL_0     0
@@ -172,9 +188,12 @@ WebServer server(80);
 #endif
 
 int samplesRead = 0;
-int16_t rawBuffer16[ESP_NOW_MAX_DATA_LEN] = {0};
-int32_t rawBuffer32[ESP_NOW_MAX_DATA_LEN] = {0};
 size_t bytesRead = 0;
+
+int16_t rawBuffer16[ESP_NOW_MAX_DATA_LEN] = {0};
+//uint8_t rawBuffer16[ESP_NOW_MAX_DATA_LEN*2] = {0};
+uint8_t rawBuffer24[ESP_NOW_MAX_DATA_LEN * 3] = {0};
+int32_t rawBuffer32[ESP_NOW_MAX_DATA_LEN] = {0};
 uint8_t buffer8[ESP_NOW_MAX_DATA_LEN * 4] = {0};
 int32_t buffer32[ESP_NOW_MAX_DATA_LEN] = {0};
 char buffer[180] = {0};
@@ -192,10 +211,15 @@ unsigned long lastScale = 0;
 unsigned long lastBluetoothConnect = 0;
 unsigned long lastButton2Hit = 0;
 unsigned long button2HitsInLast2Seconds = 0;
-Bounce bbutton1 = Bounce(0,15); 
-Bounce bbutton2 = Bounce(35,15); 
+Bounce bbutton1 = Bounce(BUTTON1,15); 
+Bounce bbutton2 = Bounce(BUTTON2,15); 
+TaskHandle_t task_tft_draw;
 
 
+#ifdef A2DP
+/* I2S_DAC_CHANNEL_BOTH_EN */
+OneChannelSoundData monoOut;
+#endif
 
 
 bool a2dp_on = false;
@@ -206,56 +230,212 @@ bool started_record = false;
 
 bool debug_output = false;
 
-bool draw_on = true;
+bool display_on = true;
+bool menu_on = false;
+bool draw_menu = true;
 bool backlight_on = true;
 bool read_mic_on = true;
 
 bool backlight_dim = false;
+bool soft_ap = false;
+
+char ip[17] = {0};
 
 
-TaskHandle_t task_tft_draw;
+// ***** MENU ***** ***** MENU ***** ***** MENU ***** ***** MENU ***** ***** MENU ***** ***** MENU ***** ***** MENU ***** ***** MENU *****
 
-#ifdef A2DP
-OneChannelSoundData monoOut;
-#endif
+typedef void (*MenuEvent)(int,byte);
 
-/*
-    I2S_DAC_CHANNEL_BOTH_EN
-*/
-int16_t map24to16(int32_t x) {
-  int32_t in_min = -8388607;
-  int32_t in_max =  8388607; 
-  int32_t out_min = -32768;
-  int32_t out_max =  32768;
-  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+char* mainMenu[] = {
+  "Record",
+  "WiFi",
+  "BlueTooth",
+  "Brightness",
+  "DisplayOff",
+  "Back",
+
+
+};
+
+char **currentMenu = mainMenu;
+int currentMenuSelection = 0;
+uint8_t currentMenuSize = sizeof(mainMenu)/sizeof(char *);
+
+void nullEvent( int control, byte ival ) {
+  Serial.println("NullEvent");
 }
 
-#ifdef WIFIUDP
-// WiFi network name and password:
+void mainMenuEvent( int control, byte ival ) {
+
+  static uint8_t dim_amount = 255;
+
+  if( currentMenuSelection == currentMenuSize-1 ) {
+    menu_on = false;
+    draw_menu = false;
+    return;
+  }
 
 
-// UDP Destination
-IPAddress udpAddress(192, 168, 250, 119);
-const int udpPort = 3333;
-// Connection state
-boolean connected = false;
+  switch(currentMenuSelection) {
+    case 0: //record
+      Serial.println("Record");
+      !record?startRecord():stopRecord();
 
-//The udp library class
-AsyncUDP udp;
+    break;
+    case 1: //WiFi 
+      Serial.println("WiFi");
+      initWiFi();
+    break;
+    case 2: //bluetooth 
+      Serial.println("BT");
+      initA2DP();
+    break;
+    case 3: //brightness 
+      ledcSetup(LEDC_CHANNEL_0, LEDC_BASE_FREQ, LEDC_TIMER_13_BIT);
+      ledcAttachPin(LED_PIN, LEDC_CHANNEL_0);
+      ledcAnalogWrite(LEDC_CHANNEL_0, dim_amount);
+    break;
+    case 4: //disp off 
+      displaySleep();
+    break;
+
+  } 
+
+}
+
+//MenuEvent currentMenuEvent = &nullEvent;
+MenuEvent currentMenuEvent = &mainMenuEvent;
+
+
+
+void displayMenu(void) {
+
+  uint8_t margin = 10;
+  uint8_t y = 0; 
+  if( draw_menu ) { 
+
+    tft.fillScreen(TFT_BLACK);
+    tft.setCursor(margin, margin, 1);
+    tft.setTextSize(1);
+    
+
+    for( int x = 0; x < currentMenuSize; x++) {
+      if( x == currentMenuSelection ) {
+        tft.setTextColor(TFT_BLACK,TFT_WHITE);  
+        tft.print(currentMenu[x]);
+      } else {
+        tft.setTextColor(TFT_WHITE,TFT_BLACK);  
+        tft.print(currentMenu[x]);
+      }
+      //y += 25; //TextSize 2
+      y += 10; //TextSize 2
+      tft.setCursor(margin, margin+y, 1);
+
+    }
+
+    tft.setTextSize(2);
+    draw_menu = false;
+
+  }
+
+}
+
+// ***** MENU ***** ***** MENU ***** ***** MENU ***** ***** MENU ***** ***** MENU ***** ***** MENU ***** ***** MENU ***** ***** MENU *****
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ***** A2DP ***** ***** A2DP ***** ***** A2DP ***** ***** A2DP ***** ***** A2DP ***** ***** A2DP ***** ***** A2DP ***** ***** A2DP *****
+#ifdef A2DP
+
+
+void deinitA2DP(void) {
+
+  Serial.println("Disabling Bluetooth");
+  //ESP.reset();
+  //a2dp_started = false;
+
+}
+
+
+
+void initA2DP(void) {
+
+  deinitWiFi();
+
+  Serial.println("Starting Bluetooth");
+  a2dp_source.start("BSR36");
+  Serial.println("Completed Setup");
+
+  if( a2dp_source.isConnected() && !a2dp_started ) {
+
+    a2dp_started = true;
+    tft.setCursor(0, 0, 1);
+    tft.print("Connected  BSR36!!!");
+    Serial.println("Connected BSR36!!!");
+    delay(1500);
+  } 
+  
+  if( !a2dp_source.isConnected() && a2dp_started ) {
+    a2dp_started = false;
+    tft.setCursor(0, 0, 1);
+    tft.print("Disconnected  BSR36!!!");
+    Serial.println("Disconnected  BSR36!!!");
+    delay(1500);
+  }
+
+  if( a2dp_started ) {
+    //monoOut.setData(rawBuffer16,samplesRead);
+    monoOut.setData(rawBuffer16,samplesRead);
+    //SoundData *data = new OneChannelSoundData(rawBuffer16,120);
+    if( !a2dp_source.writeData(&monoOut) ) Serial.println("a2dp writeData failed");
+  }
+
+ 
+}
 #endif
+// ***** A2DP ***** ***** A2DP ***** ***** A2DP ***** ***** A2DP ***** ***** A2DP ***** ***** A2DP ***** ***** A2DP ***** ***** A2DP *****
 
 
 
+
+
+
+
+// ***** WIFI ***** ***** WIFI ***** ***** WIFI ***** ***** WIFI ***** ***** WIFI ***** ***** WIFI ***** ***** WIFI ***** ***** WIFI *****
+void deinitWiFi(void) {
+
+  if( soft_ap ) { 
+    WiFi.softAPdisconnect(true);
+  } else {
+    WiFi.disconnect(true);
+  }
+
+}
 
 void initWiFi(void) {
   static unsigned long conn_start = 0;
   static bool home_conn = false;
 
-  const char * ssid = "CZ24X9P2";
-  const char * pwd = "tm2dkcssa0";
+  const char * ssid = WIFI_SSID;
+  const char * pwd = WIFI_PWD;
 
-  const char * apssid = "NinjaMic";
-  const char * appwd = "yupyup123";
+  const char * apssid = WIFI_AP_SSID; 
+  const char * appwd = WIFI_AP_PWD;
 
   IPAddress local_ip(192,168,1,1);
   IPAddress gateway(192,168,1,1);
@@ -282,7 +462,7 @@ void initWiFi(void) {
   
   if( WiFi.status() != WL_CONNECTED ) {
 
-
+      soft_ap = true;
 
       tft.fillScreen(TFT_BLACK);
       tft.setCursor(0, 0, 1);
@@ -307,8 +487,7 @@ void initWiFi(void) {
       sprintf(buffer,"SSID: %s\nPW: %s\nIP: %s\nhttp://mic.local",apssid, appwd,apip.toString().c_str());
       tft.setCursor(0, 0, 1);
       tft.print(buffer);
-
-     
+      sprintf(ip,"%s", apip.toString().c_str());
       delay(1000);
 
  
@@ -321,12 +500,28 @@ void initWiFi(void) {
 
       tft.fillScreen(TFT_BLACK);
       tft.setCursor(0, 0, 1);
-      sprintf(buffer,"WiFi IP: %s",locip);
+      sprintf(buffer,"WiFi IP: %s",locip.toString().c_str());
+      sprintf(ip,"%s",locip.toString().c_str());
       tft.print(buffer);
+      delay(3000);
   }
+
+  #ifdef WEBSERVER
+    Serial.println("Initializing WebServer");
+    server.on("/",HTTP_GET,onGetRoot);
+    server.on("/draw",HTTP_GET,onGetToggleDraw);
+    server.on("/bl",HTTP_GET,onGetToggleBacklight);
+    server.on("/mic",HTTP_GET,onGetToggleReadMic);
+    server.on("/dim",HTTP_GET,onGetDimScreen);
+    server.on("/rec.wav",HTTP_GET,onGetWav);
+    server.begin();
+    Serial.println("Initialized WebServer");
+  #endif
+
 
 
 }
+// ***** WIFI ***** ***** WIFI ***** ***** WIFI ***** ***** WIFI ***** ***** WIFI ***** ***** WIFI ***** ***** WIFI ***** ***** WIFI *****
 
 
 
@@ -352,8 +547,8 @@ void onGetRoot() {
 }
 
 void onGetToggleDraw() {
-  draw_on = draw_on?false:true;
-  sprintf(buffer,"GET /draw %s",draw_on?"on":"off");
+  display_on = display_on?false:true;
+  sprintf(buffer,"GET /draw %s",display_on?"on":"off");
   Serial.println(buffer);
   server.send(200, "text/plain", buffer);
 }
@@ -381,15 +576,16 @@ void onGetDebug() {
   tft.writecommand(ST7789_DISPOFF);    //Display off
   ledcDetachPin(TFT_BL);
   digitalWrite(TFT_BL,0);
-  draw_on = false;
+  display_on = false;
   backlight_on = false;
   read_mic_on= true;
 
   debug_output = debug_output?false:true;
-
+  sprintf(buffer,"GET /debug %s",debug_output?"on":"off");
   tft.fillScreen(TFT_BLACK);
   tft.setCursor(0, 0, 1);
   tft.print("download started");
+  server.send(200, "text/plain", buffer);
 }
 
 void onGetDimScreen() {
@@ -409,20 +605,30 @@ void onGetDimScreen() {
 
 
 void onGetWav() {
-  contentType = "application/octet-stream";
+
+  const char *contentType = "application/octet-stream";
   //contentType = "audio/wav";
-  dataFile = SD.open("/rec.wav");
-      tft.fillScreen(TFT_BLACK);
-      tft.setCursor(0, 0, 1);
-      tft.print("download started");
+
+  File dataFile = SD.open("/rec.wav");
+  /*
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0, 0, 1);
+  tft.print("download started");
+  */
+
   if( server.streamFile(dataFile,contentType) != dataFile.size() ) {
 
+      Serial.println("download fail");
       //tft.fillScreen(TFT_BLACK);
+
+      /*
       tft.setCursor(0, 0, 1);
       tft.print("\nfile download fail");
-      delay(2000);
+      */
+      //delay(2000);
 
   } 
+  dataFile.close();
 
 }
 #endif // IF WEBSERVER
@@ -451,27 +657,6 @@ void setup()
 
   Serial.begin(115200);
 
-  #ifdef WIFI
-    initWiFi();
-  #endif
-
-  pinMode(35,INPUT);
-  pinMode(0, INPUT);
-
-
-#ifdef WEBSERVER
-  Serial.println("Initializing WebServer");
-  server.on("/",HTTP_GET,onGetRoot);
-  server.on("/draw",HTTP_GET,onGetToggleDraw);
-  server.on("/bl",HTTP_GET,onGetToggleBacklight);
-  server.on("/mic",HTTP_GET,onGetToggleReadMic);
-  server.on("/dim",HTTP_GET,onGetDimScreen);
-  server.on("/wav",HTTP_GET,onGetWav);
-  server.begin();
-  Serial.println("Initialized WebServer");
-#endif
-
-
 
 
   Serial.println("Setup TFT...");
@@ -490,6 +675,14 @@ void setup()
   Serial.println("TFT Initialized");
 
   delay(1000);
+  #ifdef WIFI
+    //initWiFi();
+  #endif
+
+  pinMode(BUTTON1, INPUT);
+  pinMode(BUTTON2, INPUT);
+
+
   i2s_init_mic();
   i2s_start(I2S_PORT);
 
@@ -502,12 +695,7 @@ void setup()
   spr.createSprite(TFT_HEIGHT,TFT_WIDTH);
 
   //a2dp_source.start("BSR36",get_data_channels);
-#ifdef A2DP
-  Serial.println("Starting Bluetooth");
-  a2dp_source.start("BSR36");
-  Serial.println("Completed Setup");
-#endif
-  
+ 
 #ifdef SDCARD
   Serial.println("Using XSPI");
   xspi = new SPIClass();
@@ -669,15 +857,6 @@ void setup()
 
 
 
-
-
-
-
-
-
-
-
-
 // ***** LOOP ***** ***** LOOP ***** ***** LOOP ***** ***** LOOP ***** ***** LOOP ***** ***** LOOP ***** ***** LOOP ***** ***** LOOP *****
 void loop()
 {
@@ -708,29 +887,54 @@ void loop()
 
       }
     }
+    if( !display_on ) {
+      displayOn();
+      return;
+    }
   }
+
+
+
   if( button1 ) {
 
-    if( draw_on ) {
-      tft.writecommand(ST7789_SLPIN);
-      tft.writecommand(ST7789_DISPOFF);    //Display off
-      ledcDetachPin(LED_PIN);
-      digitalWrite(TFT_BL,0);
-      draw_on = false;
-      read_mic_on = false;
-      backlight_on = false;
-      Serial.println("Display OFF");
-    } else {
-      tft.writecommand(ST7789_SLPOUT);
-      tft.writecommand(ST7789_DISPON);
-      digitalWrite(TFT_BL,1);
-      draw_on = true;
-      read_mic_on = true;
-      backlight_on = true;
-      Serial.println("Display ON");
+    if( !menu_on ) {
+      menu_on = true;
+      draw_menu = true;
+      return;
     }
 
-    delay(2000);
+    if( menu_on ) {
+      currentMenuSelection++;
+      if( currentMenuSelection == currentMenuSize ) currentMenuSelection = 0;
+      draw_menu = true;
+    }
+    //display_on?displayOff():displayOn();
+
+
+  /*
+  // MAIN MENU BUTTON
+    if( currentMenuEvent == &mainMenuEvent ) {
+
+      (*currentMenuEvent)(BTN1,btn1);
+
+      menuSelected  = 0;
+      menuSelection = 1;
+      (*currentMenuEvent)(DISPCTRL,0);
+
+    } else {
+
+      // SUB MENU BUTTON AND IS LAST ENTRY
+      if( currentMenu->selection() == currentMenu->size()-1  ) {
+        // go back if last entry
+        Serial.println("Back Back Back");
+        currentMenu = &gfxMainMenu;
+        currentMenuEvent = &mainMenuEvent;
+        currentMenuItems = mainMenu;
+        dispPct = 0;
+
+
+  */
+    
     button1 = false;
 
   }
@@ -738,73 +942,22 @@ void loop()
   if( button2 ) lastButton2Hit = millis();
   
   if( button2  ) {
-    if( !record ) {
-      record = true; 
-      totalRecBytes = 0;
-      tft.fillScreen(TFT_BLACK);
-      tft.setCursor(0, 0, 1);
-      tft.print("Recording");
-      recFile = SD.open("/rec.wav",FILE_WRITE);
-      setWaveHeader(200000);
-      recFile.write(header,sizeof(header));
-
-
-      delay(2000);
-    } else {
- 
-      record = false;
-      started_record = false;
-      debug_output = false;
-      tft.fillScreen(TFT_BLACK);
-      
-      setWaveHeader(totalRecBytes);
-      recFile.seek(0);
-      recFile.write(header,sizeof(header));
-      recFile.close(); 
-
-      tft.setCursor(0, 0, 1);
-      sprintf(buffer,"Stopped Recording\n%d bytes written",totalRecBytes);
-      Serial.println(buffer);
-      tft.print(buffer);
-
-      delay(6000);
-      //vTaskResume(task_tft_draw);
-    }
-
-    
+    if( record ) stopRecord();
+    if( menu_on ) (*currentMenuEvent)(0,0);
+    return; 
   }
 
   if(read_mic_on) i2s_read_mic();
-  if(draw_on) tft_draw();
-
-
-
-#ifdef A2DP
-  if( a2dp_source.isConnected() && !a2dp_started ) {
-
-    a2dp_started = true;
-    tft.setCursor(0, 0, 1);
-    tft.print("Connected  BSR36!!!");
-    Serial.println("Connected BSR36!!!");
-    delay(1500);
-  } 
-  
-  if( !a2dp_source.isConnected() && a2dp_started ) {
-    a2dp_started = false;
-    tft.setCursor(0, 0, 1);
-    tft.print("Disconnected  BSR36!!!");
-    Serial.println("Disconnected  BSR36!!!");
-    delay(1500);
-  }
+  if(display_on) tft_draw();
 
   if( a2dp_started ) {
+    //monoOut.setData(rawBuffer16,samplesRead);
     monoOut.setData(rawBuffer16,samplesRead);
     //SoundData *data = new OneChannelSoundData(rawBuffer16,120);
     if( !a2dp_source.writeData(&monoOut) ) Serial.println("a2dp writeData failed");
   }
-#endif
 
-  if( !draw_on && !read_mic_on && !backlight_on ) {
+  if( !display_on && !read_mic_on && !backlight_on ) {
     delay(1000);
   } else {
     delay(1);
@@ -818,12 +971,13 @@ void loop()
 
 
 
-
-
+uint32_t cmax_threshold = 0;
 
 
 void i2s_read_mic(void) {
   //esp_err_t i2s_read_ok  = i2s_read(I2S_PORT, &buffer8, sizeof(buffer8), &bytesRead, 100);
+  static uint32_t cmax = 0;
+  uint32_t maxyz = 0;
   esp_err_t i2s_read_ok  = i2s_read(I2S_PORT, &buffer8, sizeof(buffer8), &bytesRead, portMAX_DELAY);
  
   if( i2s_read_ok == ESP_OK ) {
@@ -842,15 +996,14 @@ void i2s_read_mic(void) {
         uint8_t lsb = buffer8[i * 4 + 1];
         uint8_t mid = buffer8[i * 4 + 2];
         uint8_t msb = buffer8[i * 4 + 3];
-        //if( record && button2 == 0 ) {
-          //Serial.write(mid);
-          //Serial.write(lsb);
-  
-          //Serial.write(msb);
-          //Serial.write(mid);
-          //recFile.write(msb,sizeof(msb));
-          //recFile.write(mid,sizeof(mid));
-        //}
+
+
+        rawBuffer24[i*3+0] = msb;
+        rawBuffer24[i*3+1] = mid;
+        rawBuffer24[i*3+2] = lsb;
+
+
+
                           //   0       1        2        3 
         uint32_t raw32x = (((((xsb<<8)^lsb)<<8)^mid)<<8)^msb;
 
@@ -880,7 +1033,10 @@ void i2s_read_mic(void) {
         if( raw24 & 0x800000 && !(raw16&0x8000) ) raw16 ^= 0x8000;
         if( !(raw24 & 0x800000) && (raw16&0x8000) ) raw16 ^= 0x8000;
         rawBuffer16[i] = raw16;
+        ///rawBuffer32[i] = (raw24 * 2);
         rawBuffer32[i] = raw24;
+        buffer32[i] = (raw32m*2);
+        if(  abs(rawBuffer32[i]) > maxyz ) maxyz = abs(rawBuffer32[i]);
 
         if( debug_output  ) {
         //if( raw24 > 7000 || raw24 < -7000 ) {
@@ -910,7 +1066,7 @@ void i2s_read_mic(void) {
           sprintf(buffer,"%s = %d (32x)",btoa32m(raw32x),raw32x);
           Serial.println(buffer);
 
-          if(raw24&0x80000000) {
+          if( raw24 & 0x80000000 ) {
             sprintf(buffer,"%s = %d (negative 24)",btoa32m(raw24),raw24);
             Serial.println(buffer);
           } else {
@@ -921,43 +1077,194 @@ void i2s_read_mic(void) {
        
       } // for (int i=0; i<samplesRead; i++)
 
+      if(record && started_record ) { 
+        //if(  cmax < cmax_threshold ) memset(rawBuffer24,0,(size_t)ESP_NOW_MAX_DATA_LEN*3); 
+        memcpy(buffer8,buffer32,sizeof(buffer)); 
+        recFile.write(buffer8,sizeof(buffer8));
+        totalRecBytes += (ESP_NOW_MAX_DATA_LEN*4);
+
+
+
+
+        //recFile.write(rawBuffer24,(size_t)ESP_NOW_MAX_DATA_LEN*3);
+        //totalRecBytes += (ESP_NOW_MAX_DATA_LEN*3);
+
+
+      }
+
+
+
+
+      /*
       if( record && started_record) {
-        //recFile.write(rawBuffer16,ESP_NOW_MAX_DATA_LEN);
+        recFile.write(rawBuffer24,(size_t)ESP_NOW_MAX_DATA_LEN*3);
+        totalRecBytes += (ESP_NOW_MAX_DATA_LEN*3);
+        //recFile.write(rawBuffer16,ESP_NOW_MAX_DATA_LEN*2);
+        //recFile.write(rawBuffer24,ESP_NOW_MAX_DATA_LEN*3);
         //recFile.write(rawBuffer32,ESP_NOW_MAX_DATA_LEN);
-        recFile.write(buffer8,(size_t)bytesRead);
-        totalRecBytes += bytesRead;
+        //recFile.write(buffer8,(size_t)bytesRead);
+        //totalRecBytes += bytesRead;
         
       }
+      */
   }
 }
+void displayOff(void) {
+
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0, 0, 1);
+  tft.print(ip);
+  delay(3000);
+
+  tft.writecommand(ST7789_SLPIN);
+  tft.writecommand(ST7789_DISPOFF);    //Display off
+  ledcDetachPin(LED_PIN);
+  digitalWrite(TFT_BL,0);
+  display_on = false;
+  read_mic_on = false;
+  backlight_on = false;
+  Serial.println("Display OFF");
+
+
+}
+
+void displayOn(void) {
+  tft.writecommand(ST7789_SLPOUT);
+  tft.writecommand(ST7789_DISPON);
+  digitalWrite(TFT_BL,1);
+  display_on = true;
+  read_mic_on = true;
+  backlight_on = true;
+  Serial.println("Display ON");
+
+
+}
+
+void displaySleep(void) {
+
+  tft.writecommand(ST7789_SLPIN);
+  tft.writecommand(ST7789_DISPOFF);    //Display off
+  ledcDetachPin(LED_PIN);
+  digitalWrite(TFT_BL,0);
+  backlight_on = false;
+  display_on = false;
+
+}
+
+void startRecord(void) {
+
+  /*
+  tft.writecommand(ST7789_SLPIN);
+  tft.writecommand(ST7789_DISPOFF);    //Display off
+  ledcDetachPin(LED_PIN);
+  digitalWrite(TFT_BL,0);
+  backlight_on = false;
+  display_on = false;
+  */
+  record = true; 
+  menu_on = false;
+  draw_menu = false;
+  totalRecBytes = 0;
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0, 0, 1);
+  tft.print("Recording");
+  recFile = SD.open("/rec.wav",FILE_WRITE);
+  setWaveHeader(200000);
+  recFile.write(header,sizeof(header));
+  delay(2000);
+
+
+
+}
+
+
+void stopRecord(void) {
+
+  tft.writecommand(ST7789_SLPOUT);
+  tft.writecommand(ST7789_DISPON);
+  digitalWrite(TFT_BL,1);
+  display_on = true;
+  read_mic_on = true;
+  backlight_on = true;
+
+  record = false;
+  started_record = false;
+  debug_output = false;
+  tft.fillScreen(TFT_BLACK);
+  
+  setWaveHeader(totalRecBytes);
+  recFile.seek(0);
+  recFile.write(header,sizeof(header));
+  recFile.close(); 
+
+  tft.setCursor(0, 0, 1);
+  sprintf(buffer,"Stopped Recording\n%d bytes written",totalRecBytes);
+  Serial.println(buffer);
+  tft.print(buffer);
+
+  delay(2000);
+
+
+}
+
+
 
 
 void tft_draw(void) {
     ms = millis();
+
+    if( menu_on ) {
+      displayMenu();
+      return;
+    }
+
+    static unsigned long last_avg_update = 0;
+    static uint32_t avg = 0;
+    static uint32_t cmax = 0;
+    uint32_t maxyz = 0;
+    uint32_t inc_avg = 0;
+    uint32_t ttl_avg = 0;
+    uint32_t iavg = 0;
+    uint32_t iavg_count = 0;
+    bool should_draw = false;
 
     //if( !record && !debug_output ) {
     if( !debug_output ) {
       spr.fillSprite(TFT_BLACK);
       spr.drawFastHLine(0,67,239,TFT_WHITE);
     }
-    if( record && started_record ) {
-      // x, y , radias, corner 0x1=topleft,0x2=topright,0x3=btmright,0x4=btmleft
-      //spr.drawCircleHelper(0,0,3,2
-      //spr.fillCircleHelper(0,0,3,2
-      spr.fillCircle(230,10,5,TFT_RED);
+    if( record && started_record ) spr.fillCircle(230,10,5,TFT_RED);
 
-    }
-
-
-    if( (ms - lastScale) > 1000 && max32_y != MAP_SCALE32_DEFAULT ) {
-      //sprintf(buffer,"%d %d",max32_y,map32Scale); 
-      //Serial.println(buffer);
-      max32_y = MAP_SCALE32_DEFAULT;
-      map32Scale = MAP_SCALE32_DEFAULT;
+    if( (ms - lastScale) > 1000 && max32_y != MAP_SCALE32_DEFAULT && max32_y > MAP_SCALE32_DEFAULT ) {
+      max32_y -= (max32_y - MAP_SCALE32_DEFAULT)/3;
+      map32Scale -= (map32Scale - MAP_SCALE32_DEFAULT)/3;
       lastScale = ms;
+
     } 
 
+
+
+    /*
     for (int i=0; i<samplesRead; i++) {
+      if(  abs(rawBuffer32[i]) > maxyz ) maxyz = abs(rawBuffer32[i]);
+      //if( abs(rawBuffer32[i]) > 4300 ) {
+      if( cmax > cmax_threshold ) {
+        should_draw = true;
+      }
+    }
+    */
+    //if( should_draw  ) 
+    for (int i=0; i<samplesRead; i++) {
+        
+        if( (ms - last_avg_update) > 1000 ) {
+          inc_avg += abs(rawBuffer32[i]);
+          if( i % 10 ) {
+            ttl_avg = inc_avg/10;
+            iavg += ttl_avg;
+            inc_avg = 0;
+            iavg_count++;
+          }
+        }
         
 
         if( abs(rawBuffer32[i]) > max32_y ) {
@@ -982,9 +1289,29 @@ void tft_draw(void) {
         }
     }
 
+    /*
+    if( (ms - last_avg_update) > 1000 ) {
+      if( iavg_count  > 0 ) avg = iavg/iavg_count; 
+      last_avg_update = ms;
+      cmax = maxyz;
+    }
+    */
+    /*
+    sprintf(buffer,"avg: %d\nmax:%d",avg,cmax);
+    spr.setTextSize(2);
+    spr.setCursor(0,0,1);
+    spr.print(buffer);
+    */
+
+   
+
     spr.pushSprite(0,0);
 
 }
+
+char * getWavFileName( void ) {
+
+
 
 
 
@@ -1681,6 +2008,14 @@ char * btoa16x(int32_t n) {
     buff[15] = (n&0x800000)?'1':'0'; 
 
     return(buff);
+}
+
+int16_t map24to16(int32_t x) {
+  int32_t in_min = -8388607;
+  int32_t in_max =  8388607; 
+  int32_t out_min = -32768;
+  int32_t out_max =  32768;
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
 
